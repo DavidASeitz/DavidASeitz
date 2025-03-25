@@ -1,4 +1,5 @@
-## Hi there 👋
+# Welcome to the GitHub for David A. Seitz Strategic Consulting LLC.
+We are a Southwest Florida Based consulting firm, with decades of Technology, Operations, Finance, Marketing and Human Resources experience across a variety of industries and business sizes.
 
 <!--
 **DavidASeitz/DavidASeitz** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
