@@ -54,6 +54,22 @@ wp_real() {
     command wp --path="$SITE_PATH" "$@"
 }
 
+# Safely write a PHP script to a temp file and execute it via wp eval-file.
+# This avoids interpolating bash variables into PHP code (injection risk).
+# Usage: wp_eval_safe <<'PHP_TEMPLATE' with env vars exported beforehand.
+wp_eval_file_safe() {
+    if (( DRY_RUN )); then
+        log "[dry-run] wp eval-file (skipped)"
+        cat >/dev/null  # consume stdin
+        return 0
+    fi
+    local tmpfile
+    tmpfile=$(mktemp /tmp/dassc-wp-eval-XXXXXX.php)
+    cat > "$tmpfile"
+    command wp --path="$SITE_PATH" eval-file "$tmpfile" 2>/dev/null || true
+    rm -f "$tmpfile"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Argument parsing
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,7 +101,7 @@ preflight() {
     (( DRY_RUN )) && log "DRY RUN — no changes will be applied"
     hr
 
-    [[ -d /opt/gridpane ]] || [[ -f /etc/gridpane ]] || [[ -d /var/www ]] \
+    [[ -d /opt/gridpane ]] || [[ -f /etc/gridpane ]] \
         || die "Not a GridPane server (missing /opt/gridpane marker)"
 
     command -v wp >/dev/null 2>&1 || die "WP-CLI not found in PATH"
@@ -184,7 +200,9 @@ PHP
  * Author: DASSC
  */
 add_filter( 'rest_endpoints', function( $endpoints ) {
-    if ( is_user_logged_in() ) {
+    // get_current_user_id() works for both cookie auth and Application Password auth.
+    // is_user_logged_in() may not reliably detect Application Password sessions.
+    if ( get_current_user_id() > 0 ) {
         return $endpoints;
     }
     if ( isset( $endpoints['/wp/v2/users'] ) ) {
@@ -248,6 +266,17 @@ add_filter( 'comments_open',  '__return_false', 20 );
 add_filter( 'pings_open',     '__return_false', 20 );
 add_filter( 'comments_array', '__return_empty_array', 10 );
 add_action( 'widgets_init', function() { unregister_widget( 'WP_Widget_Recent_Comments' ); } );
+PHP
+
+    write_mu_plugin "dassc-force-app-passwords.php" <<'PHP'
+<?php
+/**
+ * Plugin Name: DASSC — Force Application Passwords
+ * Description: Ensures Application Passwords stay enabled even if a security plugin disables them.
+ *              Required for the Copilot Studio content agent (REST API auth via Application Password).
+ * Author: DASSC
+ */
+add_filter( 'wp_is_application_passwords_available', '__return_true', 999 );
 PHP
 
     log "✓ mu-plugins installed"
@@ -330,21 +359,27 @@ configure_updraftplus() {
         # Storage key: updraft_service = 's3generic' ; settings under updraft_s3generic.
         wp option update updraft_service s3generic
         local endpoint="${B2_ENDPOINT:-s3.us-west-004.backblazeb2.com}"
-        if ! (( DRY_RUN )); then
-            command wp --path="$SITE_PATH" eval "
-                update_option('updraft_s3generic', array(
-                    'settings' => array(
-                        'instance_1' => array(
-                            'accesskey'    => '${B2_ACCESS_KEY_ID}',
-                            'secretkey'    => '${B2_SECRET_ACCESS_KEY}',
-                            'path'         => '${B2_BUCKET}',
-                            'rrs'          => 0,
-                            'endpoint'     => '${endpoint}',
-                            'server_side_encryption' => 0,
-                        ),
-                    ),
-                ));"
-        fi
+        # Use eval-file with getenv() to avoid interpolating secrets into PHP code.
+        export DASSC_B2_KEY="${B2_ACCESS_KEY_ID}"
+        export DASSC_B2_SECRET="${B2_SECRET_ACCESS_KEY}"
+        export DASSC_B2_BUCKET="${B2_BUCKET}"
+        export DASSC_B2_ENDPOINT="${endpoint}"
+        wp_eval_file_safe <<'UPDRAFT_PHP'
+<?php
+update_option('updraft_s3generic', array(
+    'settings' => array(
+        'instance_1' => array(
+            'accesskey'              => getenv('DASSC_B2_KEY'),
+            'secretkey'              => getenv('DASSC_B2_SECRET'),
+            'path'                   => getenv('DASSC_B2_BUCKET'),
+            'rrs'                    => 0,
+            'endpoint'               => getenv('DASSC_B2_ENDPOINT'),
+            'server_side_encryption' => 0,
+        ),
+    ),
+));
+UPDRAFT_PHP
+        unset DASSC_B2_KEY DASSC_B2_SECRET DASSC_B2_BUCKET DASSC_B2_ENDPOINT
         log "✓ UpdraftPlus → B2 via S3-compatible endpoint ($endpoint)"
     else
         warn "B2 credentials not provided (B2_ACCESS_KEY_ID/B2_SECRET_ACCESS_KEY/B2_BUCKET) — UpdraftPlus remote storage not configured"
@@ -389,10 +424,8 @@ configure_cloudflare_plugin() {
     fi
     log "Configuring Cloudflare plugin..."
     if ! (( DRY_RUN )); then
-        command wp --path="$SITE_PATH" eval "
-            update_option('cloudflare_api_key', '${CF_API_TOKEN}');
-            update_option('cloudflare_api_email', '${CF_EMAIL:-}');
-        " >/dev/null 2>&1 || true
+        command wp --path="$SITE_PATH" option update cloudflare_api_key "$CF_API_TOKEN" >/dev/null 2>&1 || true
+        [[ -n "${CF_EMAIL:-}" ]] && command wp --path="$SITE_PATH" option update cloudflare_api_email "$CF_EMAIL" >/dev/null 2>&1 || true
     fi
     log "✓ Cloudflare cache purge integration configured"
 }
@@ -403,36 +436,42 @@ configure_wpmailsmtp() {
         return 0
     fi
     log "Configuring WP Mail SMTP..."
-    if ! (( DRY_RUN )); then
-        command wp --path="$SITE_PATH" eval "
-            update_option('wp_mail_smtp', array(
-                'mail' => array(
-                    'from_email' => '${SMTP_FROM:-no-reply@${DOMAIN}}',
-                    'from_name'  => '${CLIENT_NAME:-$DOMAIN}',
-                    'mailer'     => 'smtp',
-                    'return_path' => false,
-                ),
-                'smtp' => array(
-                    'host'       => '${SMTP_HOST}',
-                    'port'       => ${SMTP_PORT:-587},
-                    'encryption' => 'tls',
-                    'auth'       => true,
-                    'user'       => '${SMTP_USER:-}',
-                    'pass'       => '${SMTP_PASS:-}',
-                ),
-            ));" >/dev/null 2>&1 || true
-    fi
+    export DASSC_SMTP_HOST="${SMTP_HOST}"
+    export DASSC_SMTP_PORT="${SMTP_PORT:-587}"
+    export DASSC_SMTP_USER="${SMTP_USER:-}"
+    export DASSC_SMTP_PASS="${SMTP_PASS:-}"
+    export DASSC_SMTP_FROM="${SMTP_FROM:-no-reply@${DOMAIN}}"
+    export DASSC_SMTP_FROM_NAME="${CLIENT_NAME:-$DOMAIN}"
+    wp_eval_file_safe <<'SMTP_PHP'
+<?php
+update_option('wp_mail_smtp', array(
+    'mail' => array(
+        'from_email'  => getenv('DASSC_SMTP_FROM'),
+        'from_name'   => getenv('DASSC_SMTP_FROM_NAME'),
+        'mailer'      => 'smtp',
+        'return_path' => false,
+    ),
+    'smtp' => array(
+        'host'       => getenv('DASSC_SMTP_HOST'),
+        'port'       => (int) getenv('DASSC_SMTP_PORT'),
+        'encryption' => 'tls',
+        'auth'       => true,
+        'user'       => getenv('DASSC_SMTP_USER'),
+        'pass'       => getenv('DASSC_SMTP_PASS'),
+    ),
+));
+SMTP_PHP
+    unset DASSC_SMTP_HOST DASSC_SMTP_PORT DASSC_SMTP_USER DASSC_SMTP_PASS DASSC_SMTP_FROM DASSC_SMTP_FROM_NAME
     log "✓ WP Mail SMTP configured (${SMTP_HOST})"
 }
 
 configure_shortpixel() {
     log "Configuring ShortPixel..."
     if ! (( DRY_RUN )); then
-        command wp --path="$SITE_PATH" eval "
-            update_option('wp-short-pixel-compression', 1);    // 1 = lossy
-            update_option('wp-short-pixel-create-webp', 1);
-            update_option('wp-short-pixel-backup', 1);
-        " >/dev/null 2>&1 || true
+        # 1 = lossy compression
+        command wp --path="$SITE_PATH" option update wp-short-pixel-compression 1 >/dev/null 2>&1 || true
+        command wp --path="$SITE_PATH" option update wp-short-pixel-create-webp 1 >/dev/null 2>&1 || true
+        command wp --path="$SITE_PATH" option update wp-short-pixel-backup 1 >/dev/null 2>&1 || true
         if [[ -n "${SHORTPIXEL_API_KEY:-}" ]]; then
             command wp --path="$SITE_PATH" option update wp-short-pixel-apiKey "${SHORTPIXEL_API_KEY}" >/dev/null 2>&1 || true
             command wp --path="$SITE_PATH" option update wp-short-pixel-verifiedKey 1 >/dev/null 2>&1 || true
@@ -446,13 +485,15 @@ configure_shortpixel() {
 configure_gtm() {
     log "Configuring GTM..."
     if [[ -n "${GTM_CONTAINER_ID:-}" ]]; then
-        if ! (( DRY_RUN )); then
-            command wp --path="$SITE_PATH" eval "
-                \$o = get_option('gtm4wp-options', array());
-                \$o['gtm-code'] = '${GTM_CONTAINER_ID}';
-                \$o['gtm-container-code-position'] = 'codirect';   // head + body noscript
-                update_option('gtm4wp-options', \$o);" >/dev/null 2>&1 || true
-        fi
+        export DASSC_GTM_ID="${GTM_CONTAINER_ID}"
+        wp_eval_file_safe <<'GTM_PHP'
+<?php
+$o = get_option('gtm4wp-options', array());
+$o['gtm-code'] = getenv('DASSC_GTM_ID');
+$o['gtm-container-code-position'] = 'codirect';  // head + body noscript
+update_option('gtm4wp-options', $o);
+GTM_PHP
+        unset DASSC_GTM_ID
         log "✓ GTM container ${GTM_CONTAINER_ID} applied"
     else
         warn "GTM_CONTAINER_ID not set — client needs to supply GTM-XXXXXXX"
@@ -527,15 +568,14 @@ harden_users() {
             warn "Admin user is named 'admin' — rename recommended (WP doesn't support native rename; create new admin, delete old)"
         fi
 
-        # Ensure Application Passwords are available — Wordfence may have disabled them.
+        # Verify Application Passwords are available. The dassc-force-app-passwords mu-plugin
+        # ensures persistence, but verify the runtime state here as a final check.
         local ap_available
-        ap_available=$(command wp --path="$SITE_PATH" eval "echo wp_is_application_passwords_available() ? 'yes' : 'no';" 2>/dev/null || echo "no")
-        if [[ "$ap_available" != "yes" ]]; then
-            warn "Application Passwords disabled — re-enabling (required by Copilot Studio content agent)"
-            command wp --path="$SITE_PATH" eval "
-                add_filter('wp_is_application_passwords_available', '__return_true');
-                update_option('using_application_passwords', 1);
-            " >/dev/null 2>&1 || true
+        ap_available=$(command wp --path="$SITE_PATH" eval "echo wp_is_application_passwords_available() ? 'yes' : 'no';" 2>/dev/null || echo "unknown")
+        if [[ "$ap_available" == "yes" ]]; then
+            log "  ✓ Application Passwords active"
+        else
+            warn "Application Passwords may be disabled — dassc-force-app-passwords.php mu-plugin installed but runtime check returned '$ap_available'"
         fi
     fi
 
@@ -572,7 +612,7 @@ verify_and_report() {
 
     # mu-plugin syntax check
     local f
-    for f in dassc-xmlrpc-disable.php dassc-rest-api-harden.php dassc-admin-branding.php dassc-disable-comments.php; do
+    for f in dassc-xmlrpc-disable.php dassc-rest-api-harden.php dassc-admin-branding.php dassc-disable-comments.php dassc-force-app-passwords.php; do
         if php -l "$SITE_PATH/wp-content/mu-plugins/$f" >/dev/null 2>&1; then
             log "  mu-plugin $f ✓"
         else
@@ -583,6 +623,15 @@ verify_and_report() {
     command wp --path="$SITE_PATH" cron test >/dev/null 2>&1 \
         && log "  wp cron endpoint reachable ✓" \
         || warn "wp cron endpoint unreachable"
+
+    # Application Passwords
+    local ap_check
+    ap_check=$(command wp --path="$SITE_PATH" eval "echo wp_is_application_passwords_available() ? 'yes' : 'no';" 2>/dev/null || echo "unknown")
+    if [[ "$ap_check" == "yes" ]]; then
+        log "  Application Passwords: ACTIVE ✓"
+    else
+        warn "Application Passwords not active (got: $ap_check) — Copilot Studio agent will fail"
+    fi
 
     # MainWP child key
     local mainwp_key=""
@@ -595,29 +644,59 @@ verify_and_report() {
     write_json_summary "$mainwp_key"
 }
 
+plugin_status_label() {
+    local slug="$1"
+    if command wp --path="$SITE_PATH" plugin is-active "$slug" >/dev/null 2>&1; then
+        echo "active"
+    elif command wp --path="$SITE_PATH" plugin is-installed "$slug" >/dev/null 2>&1; then
+        echo "installed (inactive)"
+    else
+        echo "NOT INSTALLED"
+    fi
+}
+
 print_summary() {
     local mainwp_key="${1:-}"
     hr
     log "Scaffold complete for: $DOMAIN"
     hr
     log ""
+
+    # Dynamic plugin status
+    local b2_label="daily DB / weekly full / 14 retain"
+    [[ -z "${B2_ACCESS_KEY_ID:-}" ]] && b2_label="NEEDS B2 CREDENTIALS"
+    local redis_label
+    redis_label=$(command wp --path="$SITE_PATH" redis status 2>/dev/null | head -n1 || echo "unknown")
+    local cf_label="active"
+    [[ -z "${CF_API_TOKEN:-}" ]] && cf_label="NOT CONFIGURED — see warnings"
+    local smtp_label="configured"
+    [[ -z "${SMTP_HOST:-}" ]] && smtp_label="NOT CONFIGURED — see warnings"
+    local sp_label="active"
+    [[ -z "${SHORTPIXEL_API_KEY:-}" ]] && sp_label="NEEDS API KEY"
+    local gtm_label="${GTM_CONTAINER_ID:-NEEDS CONTAINER ID}"
+    local ap_label
+    local ap_check
+    ap_check=$(command wp --path="$SITE_PATH" eval "echo wp_is_application_passwords_available() ? 'yes' : 'no';" 2>/dev/null || echo "unknown")
+    [[ "$ap_check" == "yes" ]] && ap_label="ACTIVE" || ap_label="DISABLED — check mu-plugin"
+
     log "PLUGINS ACTIVE:"
-    log "  Security:     wordfence"
-    log "  Backup:       updraftplus → B2 (daily DB / weekly full / 14 retain)"
-    log "  Cache:        redis-cache"
-    log "  SEO:          seo-by-rank-math"
-    log "  CDN:          cloudflare"
-    log "  Monitoring:   mainwp-child"
-    log "  Email:        wp-mail-smtp"
-    log "  Images:       shortpixel-image-optimiser"
-    log "  Forms:        wpforms-lite"
-    log "  Analytics:    duracelltomi-google-tag-manager"
+    log "  Security:     wordfence ($(plugin_status_label wordfence))"
+    log "  Backup:       updraftplus → B2 ($b2_label)"
+    log "  Cache:        redis-cache ($redis_label)"
+    log "  SEO:          seo-by-rank-math ($(plugin_status_label seo-by-rank-math))"
+    log "  CDN:          cloudflare ($cf_label)"
+    log "  Monitoring:   mainwp-child ($(plugin_status_label mainwp-child))"
+    log "  Email:        wp-mail-smtp ($smtp_label)"
+    log "  Images:       shortpixel-image-optimiser ($sp_label)"
+    log "  Forms:        wpforms-lite ($(plugin_status_label wpforms-lite))"
+    log "  Analytics:    duracelltomi-google-tag-manager ($gtm_label)"
     log ""
     log "MU-PLUGINS:"
-    log "  dassc-xmlrpc-disable.php        ✓"
-    log "  dassc-rest-api-harden.php       ✓"
-    log "  dassc-admin-branding.php        ✓"
-    log "  dassc-disable-comments.php      ✓"
+    local mf mu_status
+    for mf in dassc-xmlrpc-disable.php dassc-rest-api-harden.php dassc-admin-branding.php dassc-disable-comments.php dassc-force-app-passwords.php; do
+        if [[ -f "$SITE_PATH/wp-content/mu-plugins/$mf" ]]; then mu_status="✓"; else mu_status="MISSING"; fi
+        printf '[DASSC]   %-38s %s\n' "$mf" "$mu_status"
+    done
     log ""
     log "SECURITY:"
     log "  File editing:          DISABLED"
@@ -626,7 +705,7 @@ print_summary() {
     log "  WP auto-updates:       DISABLED (maintenance pipeline)"
     log "  WP-Cron:               DISABLED (enable server cron in GridPane)"
     log "  Debug mode:            OFF"
-    log "  Application Passwords: ACTIVE"
+    log "  Application Passwords: $ap_label"
     log ""
     if [[ -n "$mainwp_key" ]]; then
         log "MAINWP CHILD KEY: $mainwp_key"
@@ -653,12 +732,24 @@ write_json_summary() {
     ts="$(date -u +%Y%m%dT%H%M%SZ)"
     local outfile="$outdir/${DOMAIN}-${ts}.json"
 
-    local plugins_json warnings_json
-    plugins_json=$(printf '"%s",' "${SUMMARY_PLUGINS[@]}" | sed 's/,$//')
+    # Build plugins JSON with versions
+    local plugins_json=""
+    local slug ver
+    for slug in "${SUMMARY_PLUGINS[@]}"; do
+        ver=$(command wp --path="$SITE_PATH" plugin get "$slug" --field=version 2>/dev/null || echo "unknown")
+        plugins_json+="    {\"slug\": \"${slug}\", \"version\": \"${ver}\"},"$'\n'
+    done
+    plugins_json=$(echo "$plugins_json" | sed '$ s/,$//')
+
+    local warnings_json=""
     if (( ${#WARNINGS[@]} )); then
-        warnings_json=$(printf '%s\n' "${WARNINGS[@]}" | sed 's/"/\\"/g' | sed 's/^/"/;s/$/",/' | tr -d '\n' | sed 's/,$//')
-    else
-        warnings_json=""
+        local w_escaped
+        for w_escaped in "${WARNINGS[@]}"; do
+            w_escaped="${w_escaped//\\/\\\\}"
+            w_escaped="${w_escaped//\"/\\\"}"
+            warnings_json+="    \"${w_escaped}\","$'\n'
+        done
+        warnings_json=$(echo "$warnings_json" | sed '$ s/,$//')
     fi
 
     cat > "$outfile" <<JSON
@@ -669,15 +760,20 @@ write_json_summary() {
   "client_name": "${CLIENT_NAME}",
   "timezone": "${TIMEZONE}",
   "timestamp_utc": "${ts}",
-  "plugins": [${plugins_json}],
+  "plugins": [
+${plugins_json}
+  ],
   "mu_plugins": [
     "dassc-xmlrpc-disable.php",
     "dassc-rest-api-harden.php",
     "dassc-admin-branding.php",
-    "dassc-disable-comments.php"
+    "dassc-disable-comments.php",
+    "dassc-force-app-passwords.php"
   ],
   "mainwp_child_key": "${mainwp_key}",
-  "warnings": [${warnings_json}]
+  "warnings": [
+${warnings_json}
+  ]
 }
 JSON
     log "JSON summary: $outfile"
